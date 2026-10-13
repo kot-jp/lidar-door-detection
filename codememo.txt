@@ -1,0 +1,66 @@
+ターミナル1: Gazeboシミュレーション
+cd ~/lidar_ws
+source install/setup.bash
+ros2 launch skid_robot_sim sim_house.launch.py
+
+ターミナル2: odom → tf変換
+cd ~/lidar_ws
+source install/setup.bash
+ros2 run door_detector odom_to_tf
+
+ターミナル3: PointCloud2 → LaserScan変換
+source /opt/ros/humble/setup.bash
+ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node --ros-args \
+  -r cloud_in:=/points \
+  -r scan:=/scan \
+  -p target_frame:=lidar_link \
+  -p min_height:=-0.1 \
+  -p max_height:=0.3
+  
+ターミナル4: slam_toolbox
+source /opt/ros/humble/setup.bash
+ros2 launch slam_toolbox online_async_launch.py
+
+ターミナル5: door_detector_node
+cd ~/lidar_ws
+source install/setup.bash
+ros2 run door_detector door_detector_node
+ros2 run door_detector door_detector_node 2>&1 | tee ~/lidar_ws/experiments/logs/node_output.log
+ros2 run door_detector door_detector_new_node 2>&1 | tee ~/lidar_ws/experiments/logs/node_output.log
+ros2 run door_detector door_detector_new_node --ros-args --log-level door_detector:=debug 2>&1 | tee ~/lidar_ws/experiments/logs/node_output.log
+
+ターミナル6: RViz
+source /opt/ros/humble/setup.bash
+rviz2
+
+teleop操作
+ros2 run teleop_twist_keyboard teleop_twist_keyboard 
+
+ドアパターン
+cd ~/lidar_ws/experiments
+./pattern_A.sh
+
+cd ~/lidar_ws/experiments
+./pattern_B.sh
+
+ros2 bag record開始
+cd ~/lidar_ws/experiments/logs
+ros2 bag record -o round1_bag /points /door_markers /tf /tf_static
+ros2 bag record開始(同名フォルダがあると失敗するので、-o の名前は毎回変える)
+
+door_detector_node.pyだけbuildするとき
+colcon build --symlink-install --packages-select door_detector
+
+logsにcsv保存
+cp /tmp/door_experiment_log.csv ~/lidar_ws/experiments/logs/自分で決める.csv
+
+実験後のlogs退避と新規logsの生成
+cd ~/lidar_ws/experiments
+mv logs logs_新しい名前
+mkdir logs
+
+実験データの解析
+cd ~/lidar_ws/experiments
+python3 analyze_results.py
+
+
