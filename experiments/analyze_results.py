@@ -168,7 +168,7 @@ def summarize(rows_by_door, pattern: dict, out_csv: Path):
     fieldnames = [
         "door_name", "n_samples", "expected_angle", "expected_free_width",
         "expected_state", "detected_avg_gap", "detected_open_ratio",
-        "gap_error",
+        "gap_error", "n_gap_known",
         "near_n_samples", "near_avg_gap", "near_gap_error",
     ]
     lines = []
@@ -176,13 +176,17 @@ def summarize(rows_by_door, pattern: dict, out_csv: Path):
         exp_gap = expected_free_width(angle)
         exp_state = expected_state(angle)
         samples = rows_by_door.get(name, [])
-        near_samples = [s for s in samples if s["dist_to_door"] <= NEAR_DIST_THRESH]
+        # gap>=0(既知)のサンプルだけで平均を取る。gap<0は「closed/判定不能」の印
+        known = [s for s in samples if s["gap"] >= 0]
+        near_samples = [s for s in known if s["dist_to_door"] <= NEAR_DIST_THRESH]
         if samples:
-            avg_gap = sum(s["gap"] for s in samples) / len(samples)
             open_ratio = sum(1 for s in samples if s["state"] == "open") / len(samples)
         else:
-            avg_gap = float("nan")
             open_ratio = float("nan")
+        if known:
+            avg_gap = sum(s["gap"] for s in known) / len(known)
+        else:
+            avg_gap = float("nan")
         if near_samples:
             near_avg_gap = sum(s["gap"] for s in near_samples) / len(near_samples)
         else:
@@ -193,9 +197,10 @@ def summarize(rows_by_door, pattern: dict, out_csv: Path):
             "expected_angle": angle,
             "expected_free_width": round(exp_gap, 3),
             "expected_state": exp_state,
-            "detected_avg_gap": round(avg_gap, 3) if samples else "",
+            "detected_avg_gap": round(avg_gap, 3) if known else "",
             "detected_open_ratio": round(open_ratio, 3) if samples else "",
-            "gap_error": round(avg_gap - exp_gap, 3) if samples else "",
+            "gap_error": round(avg_gap - exp_gap, 3) if known else "",
+            "n_gap_known": len(known),
             "near_n_samples": len(near_samples),
             "near_avg_gap": round(near_avg_gap, 3) if near_samples else "",
             "near_gap_error": round(near_avg_gap - exp_gap, 3) if near_samples else "",
@@ -318,14 +323,14 @@ def export_timeseries(rows_by_door, pattern: dict, out_csv: Path):
 
 def plot_timeseries(rows_by_door, pattern: dict, out_png: Path, title: str):
     """ドアごとにhorizontal_gapの時系列を、10ドア分まとめてグリッド表示する。
-    点の色はstate(open=緑, closed=赤)、破線は正解のexpected_free_width。"""
+    点の色はstate(open=緑, closed=赤)。gap>=0(既知)は丸、gap<0(closed/判定不能)は
+    ×印でy=0に描く。破線は正解のexpected_free_width。"""
     names = list(pattern.keys())
     n = len(names)
     ncols = 2
     nrows = math.ceil(n / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(12, 3 * nrows), squeeze=False)
 
-    # 全ドア共通のx軸範囲(このラウンド全体のstamp範囲)を先に求めておく
     all_stamps = [s["stamp"] for samples in rows_by_door.values() for s in samples]
     if all_stamps:
         xmin, xmax = min(all_stamps), max(all_stamps)
@@ -338,10 +343,20 @@ def plot_timeseries(rows_by_door, pattern: dict, out_png: Path, title: str):
         ax = axes[i // ncols][i % ncols]
         samples = sorted(rows_by_door.get(name, []), key=lambda s: s["stamp"])
         if samples:
-            stamps = [s["stamp"] for s in samples]
-            gaps = [s["gap"] for s in samples]
-            colors = ["tab:green" if s["state"] == "open" else "tab:red" for s in samples]
-            ax.scatter(stamps, gaps, c=colors, s=8)
+            known = [s for s in samples if s["gap"] >= 0]
+            unknown = [s for s in samples if s["gap"] < 0]
+            if known:
+                ax.scatter(
+                    [s["stamp"] for s in known], [s["gap"] for s in known],
+                    c=["tab:green" if s["state"] == "open" else "tab:red" for s in known],
+                    marker="o", s=8, zorder=3,
+                )
+            if unknown:
+                ax.scatter(
+                    [s["stamp"] for s in unknown], [0.0] * len(unknown),
+                    c=["tab:green" if s["state"] == "open" else "tab:red" for s in unknown],
+                    marker="x", s=14, zorder=3,
+                )
         exp_gap = expected_free_width(pattern[name])
         ax.axhline(exp_gap, color="gray", linestyle="--", linewidth=1)
         ax.axhline(0.7, color="black", linestyle=":", linewidth=0.7)
@@ -352,17 +367,16 @@ def plot_timeseries(rows_by_door, pattern: dict, out_png: Path, title: str):
         ax.set_ylabel("通行幅 horizontal_gap [m]", fontsize=12)
         ax.tick_params(labelsize=11)
 
-    # 空きサブプロットを消す
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
 
     fig.suptitle(title, fontsize=18)
-    fig.text(0.5, 0.005, "（緑=open、赤=closed、グレー破線=正解値、黒点線=0.7mしきい値）",
+    fig.text(0.5, 0.005,
+              "（緑=open、赤=closed、○=通行幅あり、×=不明/判定なし、グレー破線=正解値、黒点線=0.7mしきい値）",
               ha="center", fontsize=12)
     fig.tight_layout(rect=(0.01, 0.03, 1, 0.97))
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
-
 
 def plot_combined_timeseries(round_data: dict, out_png: Path, title: str):
     """round1/round2両方を、ドアごとに1枚のグラフ内で表示する。
@@ -421,11 +435,25 @@ def plot_combined_timeseries(round_data: dict, out_png: Path, title: str):
             samples = sorted(rows_by_door.get(name, []), key=lambda s: s["stamp"])
             if not samples:
                 continue
-            stamps = [compressed(round_name, s["stamp"]) for s in samples]
-            gaps = [s["gap"] for s in samples]
-            colors = ["tab:green" if s["state"] == "open" else "tab:red" for s in samples]
             marker = round_markers.get(round_name, "o")
-            ax.scatter(stamps, gaps, c=colors, marker=marker, s=10, zorder=3)
+            known = [s for s in samples if s["gap"] >= 0]
+            unknown = [s for s in samples if s["gap"] < 0]
+            if known:
+                ax.scatter(
+                    [compressed(round_name, s["stamp"]) for s in known],
+                    [s["gap"] for s in known],
+                    c=["tab:green" if s["state"] == "open" else "tab:red" for s in known],
+                    marker=marker, s=10, zorder=3,
+                )
+            if unknown:
+                # gap<0(closed/判定不能)はy=0に×印で描く
+                ax.scatter(
+                    [compressed(round_name, s["stamp"]) for s in unknown],
+                    [0.0] * len(unknown),
+                    c=["tab:green" if s["state"] == "open" else "tab:red" for s in unknown],
+                    marker="x", s=14, zorder=3,
+                )
+            stamps = [compressed(round_name, s["stamp"]) for s in samples]
             exp_gap = expected_free_width(pattern[name])
             ax.hlines(exp_gap, min(stamps), max(stamps), color="gray",
                       linestyle="--", linewidth=1, zorder=2)
@@ -491,10 +519,11 @@ def plot_combined_timeseries(round_data: dict, out_png: Path, title: str):
         Line2D([0], [0], color="gray", linestyle="--", label="正解値(ラウンドごと)"),
         Line2D([0], [0], color="black", linestyle=":", label="0.7mしきい値"),
         Line2D([0], [0], color="goldenrod", linewidth=1.5, label="最接近時刻(通過ごと、距離[m])"),
+        Line2D([0], [0], marker="x", color="gray", linestyle="None", markersize=7, label="×=不明/判定なし"),
     ]
-    fig.legend(handles=legend_elements, loc="lower center", ncol=7, fontsize=11,
+    fig.legend(handles=legend_elements, loc="lower center", ncol=4, fontsize=10,
                bbox_to_anchor=(0.5, 0.0))
-    fig.tight_layout(rect=(0.01, 0.05, 1, 0.96))
+    fig.tight_layout(rect=(0.01, 0.07, 1, 0.96))
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
 

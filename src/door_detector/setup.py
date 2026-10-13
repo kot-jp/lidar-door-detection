@@ -16,6 +16,7 @@ setup(
     entry_points={
         'console_scripts': [
             'door_detector_node = door_detector.door_detector_node:main',
+            'door_detector_new_node = door_detector.door_detector_new_node:main',
             'odom_to_tf = door_detector.odom_to_tf:main',
         ],
     },

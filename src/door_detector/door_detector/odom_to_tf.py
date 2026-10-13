@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""odom_to_tf.py: /odom を購読して odom -> base_footprint の tf を発行する"""
+"""odom_to_tf.py: /odom を購読して odom -> base_footprint の tf を発行する。
+ロボットは world 座標 (1.0, 0.0) にスポーンするが、/odom は起動位置を原点とする
+相対座標系のため、map(=world)座標に合わせて起動位置ぶんのオフセットを足す。"""
 
 import rclpy
 from rclpy.node import Node
@@ -7,6 +9,10 @@ from nav_msgs.msg import Odometry
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 from rclpy.parameter import Parameter
+
+# launchファイルの spawn_robot の -x, -y と一致させる
+SPAWN_X = 1.0
+SPAWN_Y = 0.0
 
 class OdomToTf(Node):
     def __init__(self):
@@ -21,8 +27,8 @@ class OdomToTf(Node):
         t.header.frame_id = 'odom'
         t.child_frame_id = 'base_footprint'
 
-        t.transform.translation.x = msg.pose.pose.position.x
-        t.transform.translation.y = msg.pose.pose.position.y
+        t.transform.translation.x = msg.pose.pose.position.x + SPAWN_X
+        t.transform.translation.y = msg.pose.pose.position.y + SPAWN_Y
         t.transform.translation.z = msg.pose.pose.position.z
         t.transform.rotation = msg.pose.pose.orientation
 

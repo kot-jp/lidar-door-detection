@@ -47,7 +47,7 @@ class Wall:
     end: np.ndarray         # 端点2 (XY)
     direction: np.ndarray   # 単位方向ベクトル(XY)
     length: float
-
+    fit_residual: float = 0.0   # ★追加：直線フィットの残差(点群のばらつき)
 
 @dataclass
 class DoorCandidate:
@@ -63,6 +63,9 @@ class DoorCandidate:
     beyond_open: bool = False   # ★追加：奥行き判定の結果
     horizontal_gap: float = 0.0   # ★追加：直進時に実際に使える通行幅
     source: str = "gap"   # ★追加：どの方式で見つけたか（"gap" / "recess" / "knob"）
+    leaf_yaw: Optional[float] = None       # ★追加：検出したleafの向き
+    leaf_centroid: Optional[np.ndarray] = None  # ★追加：検出したleafの重心
+    leaf_length: Optional[float] = None    # ★追加：検出したleafの長さ
 
 @dataclass
 class DoorTrack:
@@ -168,8 +171,9 @@ class DoorDetectorNode(Node):
         # --- パラメータ ---
         self.declare_parameter('max_detection_range', 4.0)
         self.declare_parameter('num_walls', 8)
-        self.declare_parameter('ransac_iterations', 25)
+        self.declare_parameter('ransac_iterations', 50)
         self.declare_parameter('ransac_inlier_thresh', 0.05)
+        self.declare_parameter('ransac_max_gap', 0.3)  # inlierの歯抜け許容距離、これを超えるとスコアを割り引く
         self.declare_parameter('min_wall_points', 25)
         self.declare_parameter('min_wall_length', 0.3)
 
@@ -184,10 +188,14 @@ class DoorDetectorNode(Node):
         self.declare_parameter('frame_dir_sim_thresh', 0.90)
         self.declare_parameter('leaf_angle_thresh', 0.15)  # rad, これ未満は壁と同一とみなす
 
-        self.declare_parameter('recess_min_depth', 0.02)
+        self.declare_parameter('recess_min_depth', 0.10)
+        self.declare_parameter('recess_residual_ratio_thresh', 2.5)  # 合体フィットの残差悪化率、これ未満なら同一壁とみなす
+        self.declare_parameter('recess_overlap_ratio_thresh', 0.3)
+        self.declare_parameter('wall_endpoint_merge_dist', 0.5)  # この距離以内の端点は、recess判定より優先して同一壁統合
         self.declare_parameter('recess_max_depth', 0.20)   # 20cmまで拡張
         self.declare_parameter('recess_min_length', 0.3)
         self.declare_parameter('recess_max_length', 1.3)   # ドアとして不自然に長すぎないか
+        self.declare_parameter('recess_split_min_density', 15.0)  # 1mあたり最低点数
 
         # ★追加：奥行き検出・通行可能判定まわり
         self.declare_parameter('beyond_min_points', 20)          # 奥まで届いた点の最低数
@@ -205,7 +213,7 @@ class DoorDetectorNode(Node):
         self.declare_parameter('knob_search_range', 2.0)   # ノブ探索を行う最大距離
 
         self.declare_parameter('track_match_dist', 0.5)
-        self.declare_parameter('track_max_miss', 8)
+        self.declare_parameter('track_max_miss', 20)
 
         self.declare_parameter('self_filter_x', 0.50)
         self.declare_parameter('self_filter_y', 0.45)
@@ -254,6 +262,7 @@ class DoorDetectorNode(Node):
         self.num_walls           = g('num_walls').value
         self.ransac_iters        = g('ransac_iterations').value
         self.ransac_inlier_thresh = g('ransac_inlier_thresh').value
+        self.ransac_max_gap = g('ransac_max_gap').value
         self.min_wall_points     = g('min_wall_points').value
         self.min_wall_length     = g('min_wall_length').value
 
@@ -267,9 +276,13 @@ class DoorDetectorNode(Node):
         self.leaf_angle_thresh = g('leaf_angle_thresh').value
 
         self.recess_min_depth  = g('recess_min_depth').value
+        self.recess_residual_ratio_thresh = g('recess_residual_ratio_thresh').value
+        self.recess_overlap_ratio_thresh = g('recess_overlap_ratio_thresh').value
+        self.wall_endpoint_merge_dist = g('wall_endpoint_merge_dist').value
         self.recess_max_depth  = g('recess_max_depth').value
         self.recess_min_length = g('recess_min_length').value
-        self.recess_max_length = g('recess_max_length').value   
+        self.recess_max_length = g('recess_max_length').value
+        self.recess_split_min_density = g('recess_split_min_density').value   
 
         self.beyond_min_points = g('beyond_min_points').value
         self.beyond_margin = g('beyond_margin').value
@@ -521,7 +534,26 @@ class DoorDetectorNode(Node):
                 closest = p1 + np.outer(proj, direction)
                 dist = np.linalg.norm(remaining - closest, axis=1)
                 mask = dist < self.ransac_inlier_thresh
-                score = int(np.sum(mask))
+                raw_count = int(np.sum(mask))
+                if raw_count < self.min_wall_points:
+                    continue
+
+                # ★追加：inlierが直線に沿って連続しとるか(歯抜けが無いか)を評価する。
+                # 点数が多くても、歯抜けだらけの直線は「壁の一部だけを偶然拾った」
+                # 可能性が高いため、スコアを割り引く。
+                inlier_proj = np.sort(proj[mask])
+                gaps = np.diff(inlier_proj)
+                max_gap = float(gaps.max()) if len(gaps) > 0 else 0.0
+                # ★変更：LiDARは角度分解能が一定なので、遠距離ほど点間隔が
+                # 自然に開く。壁までのおおよその距離(p1からの距離)に応じて、
+                # 許容する歯抜けの大きさも線形に広げる。
+                approx_dist = float(np.linalg.norm(p1))
+                adaptive_max_gap = self.ransac_max_gap * max(1.0, approx_dist / 1.5)
+                if max_gap > adaptive_max_gap:
+                    continuity_penalty = 0.5
+                else:
+                    continuity_penalty = 1.0
+                score = raw_count * continuity_penalty
 
                 if score > best_score:
                     best_score = score
@@ -534,6 +566,13 @@ class DoorDetectorNode(Node):
             wall = self._fit_wall(wall_pts)
             if wall is not None and wall.length >= self.min_wall_length:
                 walls.append(wall)
+                self.get_logger().info(
+                    f"[debug] wall抽出: n={len(wall_pts)} length={wall.length:.2f} "
+                    f"start=({wall.start[0]:.2f},{wall.start[1]:.2f}) "
+                    f"end=({wall.end[0]:.2f},{wall.end[1]:.2f}) "
+                    f"remaining_before={len(remaining)}"
+                )
+
 
             remaining = remaining[~best_mask]
 
@@ -576,11 +615,27 @@ class DoorDetectorNode(Node):
                     )
                 )
 
-                # ★ここに追加
                 self.get_logger().info(
                     f"[debug] dir_sim={dir_sim:.3f} line_dist={line_dist:.4f} w.length={w.length:.2f} "
                     f"(recess range: {self.recess_min_depth}-{self.recess_max_depth})"
                 )
+
+                # ★追加：端点同士が近ければ、recess判定より先に「同一壁の分裂」として統合を試みる。
+                # RANSACの都合で、同じ壁が複数回に分けて検出されることがあり、
+                # その場合は端点(壁の端)が近い位置に来ることが多いため。
+                d_endpoint = min(
+                    np.linalg.norm(base.start - w.start),
+                    np.linalg.norm(base.start - w.end),
+                    np.linalg.norm(base.end - w.start),
+                    np.linalg.norm(base.end - w.end),
+                )
+                if d_endpoint < self.wall_endpoint_merge_dist:
+                    self.get_logger().info(
+                        f"[debug] 端点近接につきrecess判定より優先して統合: d_endpoint={d_endpoint:.3f}"
+                    )
+                    cluster.append(w)
+                    used[j] = True
+                    continue
 
                 # ★奥まり判定：2〜10cm程度なら「閉じたドア板」候補として記録
                 if self.recess_min_depth <= line_dist <= self.recess_max_depth:
@@ -593,14 +648,7 @@ class DoorDetectorNode(Node):
                     continue
 
                 # ② 距離が近いか（端点同士）
-                d = min(
-                    np.linalg.norm(base.start - w.start),
-                    np.linalg.norm(base.start - w.end),
-                    np.linalg.norm(base.end - w.start),
-                    np.linalg.norm(base.end - w.end),
-                )
-
-                if d < 0.3:  # ←ここは調整値
+                if d_endpoint < 0.3:
                     cluster.append(w)
                     used[j] = True
 
@@ -644,11 +692,27 @@ class DoorDetectorNode(Node):
 
         result = []
         for seg in segments:
-            if len(seg) < 5:
+            if len(seg) < 8:
                 continue
             fit = self._fit_wall(seg)
-            if fit is not None and self.recess_min_length <= fit.length <= self.recess_max_length:
-                result.append(fit)
+            if fit is None:
+                continue
+            if not (self.recess_min_length <= fit.length <= self.recess_max_length):
+                continue
+            # ★追加：区画の点密度が低すぎる場合は棄却(疎らな点の偶然の並びを除外)
+            density = len(seg) / max(fit.length, 0.05)
+            if density < self.recess_split_min_density:
+                self.get_logger().info(
+                    f"[debug] recess区画棄却: 密度不足 length={fit.length:.2f} "
+                    f"n={len(seg)} density={density:.1f}pts/m center=({fit.start[0]:.2f}〜{fit.end[0]:.2f})"
+                )
+                continue
+            # ★追加：通過した区画もログに出す
+            self.get_logger().info(
+                f"[debug] recess区画通過: length={fit.length:.2f} "
+                f"n={len(seg)} density={density:.1f}pts/m center=({fit.start[0]:.2f}〜{fit.end[0]:.2f})"
+            )
+            result.append(fit)
 
         self.get_logger().info(
             f"[debug] recess split: 元の長さ={w.length:.2f} -> {len(result)}個の区画 "
@@ -670,9 +734,13 @@ class DoorDetectorNode(Node):
         start = center + proj.min() * direction
         end = center + proj.max() * direction
         length = float(proj.max() - proj.min())
+        # ★追加：直線からの垂直距離(残差)のRMSを計算する
+        perp = (pts_2d - center) - np.outer(proj, direction)
+        fit_residual = float(np.sqrt(np.mean(np.sum(perp**2, axis=1))))
         return Wall(
             points=pts_2d, start=start, end=end,
-            direction=direction, length=length
+            direction=direction, length=length,
+            fit_residual=fit_residual,
         )
 
     def _angle_between(self, d1: np.ndarray, d2: np.ndarray) -> float:
@@ -693,9 +761,21 @@ class DoorDetectorNode(Node):
         final_candidates = list(trusted_frame)  # 信頼できるframe候補は無条件で採用
         dedup_dist = 0.4
 
+        # ★追加：検出済みleafの情報を集めておく
+        detected_leaves = [
+            (c.leaf_yaw, c.leaf_centroid, c.leaf_length)
+            for c in trusted_frame
+            if c.leaf_yaw is not None
+        ]
+
         # recess候補：信頼できるframe候補と近ければ捨てる(信頼できるframeを優先)
         filtered_recess = []
         if recess_walls:
+            # ★追加：leafと同一物と思われるrecess壁は事前に除外する
+            recess_walls = [
+                w for w in recess_walls
+                if not self._wall_matches_leaf(w, detected_leaves)
+            ]
             recess_candidates = self._recess_to_candidates(recess_walls)
             for rc in recess_candidates:
                 near_trusted = any(
@@ -736,6 +816,35 @@ class DoorDetectorNode(Node):
             final_candidates.append(uc)
 
         return final_candidates
+
+    def _wall_matches_leaf(self, wall: Wall, leaves) -> bool:
+        """このrecess壁が、既に検出済みの開いた扉板(leaf)と同一物である
+        可能性が高いかを判定する。半開きドアのリーフが壁の延長線上に
+        近い角度で立つと、_merge_wallsで別の壁(recess)として誤って
+        拾われてしまうことがある。向きの近さと位置の近さの両方で判定する。"""
+        wall_center = (wall.start + wall.end) / 2.0
+        for leaf_yaw, leaf_centroid, leaf_length in leaves:
+            if leaf_centroid is None:
+                continue
+            leaf_dir = np.array([np.cos(leaf_yaw), np.sin(leaf_yaw)])
+            dir_sim = abs(wall.direction @ leaf_dir)
+            dist = np.linalg.norm(wall_center - leaf_centroid)
+            # ★追加：判定結果に関わらず、比較の詳細を出す
+            self.get_logger().info(
+                f"[debug] leaf照合試行: wall_center=({wall_center[0]:.2f},{wall_center[1]:.2f}) "
+                f"leaf_centroid=({leaf_centroid[0]:.2f},{leaf_centroid[1]:.2f}) "
+                f"dir_sim={dir_sim:.2f} dist={dist:.2f} thresh={max(leaf_length, wall.length)*0.6+0.3:.2f}"
+            )
+            if dir_sim < 0.85:
+                continue
+            if dist < max(leaf_length, wall.length) * 0.6 + 0.3:
+                self.get_logger().info(
+                    f"[debug] recess壁をleaf由来として除外: "
+                    f"wall_center=({wall_center[0]:.2f},{wall_center[1]:.2f}) "
+                    f"dir_sim={dir_sim:.2f} dist={dist:.2f}"
+                )
+                return True
+        return False
     
     def _recess_to_candidates(self, recess_walls: List[Wall]) -> List[DoorCandidate]:
         """奥まった壁（＝閉じたドア板）を、隙間検出を経由せず直接 DoorCandidate に変換する。"""
@@ -892,58 +1001,79 @@ class DoorDetectorNode(Node):
         ratio = (dist_to_door - near) / (far - near)
         return int(round(pts_near + ratio * (pts_far - pts_near)))
     
-    def _detect_depth_beyond_frame(self, frame: dict, points_3d: np.ndarray,
-                                     wall_dist_estimate: float) -> bool:
-        """枠の見える角度範囲の中に、壁までの距離より明らかに遠い点が
-        あるかを調べる。扉の種類（開き戸／引き戸）を問わず、
-        通路が空いているかどうかを判定できる指標。
-
-        v4.9: 斜め視点への対応。ロボットが枠の正面ではなく斜め（廊下を
-        並走しているときなど）から見ている場合、枠の「見た目の幅」は
-        実際の frame_width より狭くなる（遠近法による圧縮）。
-        これを補正しないと、見る角度の範囲を実際より広く取ってしまい、
-        隣の枠や廊下奥の壁まで誤って拾ってしまう。
-        枠の向き(wall_yaw)とロボットの視線方向(frame_angle)の差から
-        視聴角度を求め、cosで見た目の幅を補正する。
+    def _depth_clusters(self, distances: np.ndarray, gap_thresh: float = 0.25):
+        """distancesを深さ方向にソートして、gap_thresh以上の隙間があるところで
+        複数の塊(クラスタ)に分割する。1次元版の_split_recess_wallと同じ考え方。
+        戻り値: [(mean_dist, count, std), ...] を近い順に並べたリスト
         """
+        if len(distances) == 0:
+            return []
+        d_sorted = np.sort(distances)
+        gaps = np.diff(d_sorted)
+        split_indices = np.where(gaps > gap_thresh)[0]
+
+        clusters = []
+        start = 0
+        for idx in split_indices:
+            seg = d_sorted[start:idx + 1]
+            clusters.append((float(seg.mean()), len(seg), float(seg.std())))
+            start = idx + 1
+        seg = d_sorted[start:]
+        clusters.append((float(seg.mean()), len(seg), float(seg.std())))
+        return clusters
+
+
+    def _detect_depth_beyond_frame(self, frame: dict, points_3d: np.ndarray,wall_dist_estimate: float) -> bool:
         xy = points_3d[:, :2]
         dist_from_sensor = np.linalg.norm(xy, axis=1)
 
-        # ロボットから見た「枠の中心方向」の角度
         frame_angle = np.arctan2(frame['center'][1], frame['center'][0])
-
-        # v4.9: 視聴角度を求める（枠の向きの法線方向と、ロボットの視線方向の差）
-        # frame['wall_yaw'] は壁が伸びている方向なので、+pi/2 したものが壁の法線（開口部の正面方向）
         wall_normal = frame['wall_yaw'] + np.pi / 2.0
         viewing_angle = np.arctan2(
             np.sin(frame_angle - wall_normal),
             np.cos(frame_angle - wall_normal)
         )
-        # cosが小さい（真横に近い）ほど見た目の幅が狭くなる。0除算防止に下限を設ける
         foreshorten = max(abs(np.cos(viewing_angle)), 0.15)
         apparent_width = frame['frame_width'] * foreshorten
-
         half_angle = np.arctan2(apparent_width * 0.5, max(wall_dist_estimate, 0.1))
 
         point_angles = np.arctan2(xy[:, 1], xy[:, 0])
         angle_diff_to_frame = np.abs(
             np.arctan2(np.sin(point_angles - frame_angle), np.cos(point_angles - frame_angle))
         )
-
         near_frame_mask = angle_diff_to_frame < half_angle
-        beyond_wall_mask = dist_from_sensor > (wall_dist_estimate + self.beyond_margin)
 
-        beyond_points = points_3d[near_frame_mask & beyond_wall_mask]
+        # ↓ここから変更: 単純カウントではなく深さクラスタ解析に置き換え
+        window_dists = dist_from_sensor[near_frame_mask]
+        clusters = self._depth_clusters(window_dists, gap_thresh=self.beyond_margin * 0.6)
         required_points = self._reliability_adjusted_min_points(wall_dist_estimate)
 
-        if len(beyond_points) >= required_points:
-            self.get_logger().info(
-                f"[debug] beyond points found: n={len(beyond_points)} "
-                f"viewing_angle_deg={np.degrees(viewing_angle):.1f} foreshorten={foreshorten:.2f} "
-                f"dists={[round(float(np.linalg.norm(p[:2])), 2) for p in beyond_points[:5]]}"
-            )
+        beyond_clusters = [c for c in clusters if c[0] > wall_dist_estimate + self.beyond_margin]
+        if not beyond_clusters:
+            return False
 
-        return len(beyond_points) >= required_points
+        # ★連続性チェック1: 枠とbeyond領域の「間」に別の密な構造が挟まってないか
+        intermediate_clusters = [
+            c for c in clusters
+            if wall_dist_estimate + 0.05 < c[0] <= wall_dist_estimate + self.beyond_margin
+            and c[1] >= 5
+        ]
+        if intermediate_clusters:
+            self.get_logger().info(
+                f"[debug] beyond判定保留: 中間構造あり intermediate={intermediate_clusters}"
+            )
+            return False
+
+        # ★連続性チェック2: beyondクラスタ自体がまとまってるか(外れ値じゃないか)
+        mean_d, count, std = beyond_clusters[0]
+        if count >= required_points and std < 0.5:
+            self.get_logger().info(
+                f"[debug] beyond cluster確定: mean_dist={mean_d:.2f} n={count} std={std:.2f} "
+                f"viewing_angle_deg={np.degrees(viewing_angle):.1f}"
+            )
+            return True
+
+        return False
 
     def _detect_leaf(self, frame: dict, points_3d: np.ndarray):
         frame_width = frame['frame_width']
@@ -962,9 +1092,20 @@ class DoorDetectorNode(Node):
             diffs = xy - hinge_pt
             perp_dist = np.abs(diffs[:, 0] * wall_dir[1] - diffs[:, 1] * wall_dir[0])
 
-            # hingeからleaf_length分の範囲内、かつrecess_max_depthより浮いてる点だけ対象
-            nearby_mask = (dist_to_hinge < frame_width * 1.3) & (perp_dist > self.recess_max_depth)
+            # ★変更：蝶番からの距離に応じて、要求する垂直距離のしきい値を線形に緩める。
+            # 浅い開き角度だと蝶番付近の点はperp_distが小さくなりがちで、
+            # 固定しきい値だと手前側の点が丸ごと切り捨てられてしまうため。
+            adaptive_depth_thresh = np.minimum(
+                self.recess_max_depth,
+                dist_to_hinge * 0.35
+            )
+            nearby_mask = (dist_to_hinge < frame_width * 1.3) & (perp_dist > adaptive_depth_thresh)
             nearby = points_3d[nearby_mask]
+
+            self.get_logger().info(
+                f"[debug] leaf候補点数: nearby={len(nearby)} "
+                f"frame_width={frame_width:.2f} hinge=({hinge_pt[0]:.2f},{hinge_pt[1]:.2f})"
+            )
 
             if len(nearby) < 15:
                 continue
@@ -1165,6 +1306,7 @@ class DoorDetectorNode(Node):
                 self.get_logger().info(
                     f"leaf reject: 距離依存の急角度棄却 dist={dist_to_door:.2f} "
                     f"angle_diff={leaf['angle_diff']:.2f} thresh={angle_reject_thresh:.2f}"
+                    f"center=({frame['center'][0]:.2f},{frame['center'][1]:.2f})"
                 )
                 leaf = None
 
@@ -1210,6 +1352,8 @@ class DoorDetectorNode(Node):
             depth_score=free_width, height_score=1.0, occupancy_score=0.0,
             angle_diff=leaf['angle_diff'], beyond_open=beyond_open,
             horizontal_gap=horizontal_gap, source="gap",
+            leaf_yaw=leaf['leaf_yaw'], leaf_centroid=leaf['leaf_centroid'],
+            leaf_length=leaf['leaf_length'],
         )
     # =====================================================================
     # トラッキング
